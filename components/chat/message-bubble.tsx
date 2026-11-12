@@ -583,6 +583,44 @@ function PlainTextContent({ content, className }: { content: string; className?:
     );
 }
 
+const _bilingualVoiceAudioCache = new Map<string, string>();
+const _bilingualVoiceInFlight = new Map<string, Promise<string>>();
+
+function cleanDialogueForTts(raw: string): string {
+    return raw
+        .replace(/^[“"「『\s]+|[”"」』\s]+$/g, "")
+        .replace(/\*\*([^*]+)\*\*/g, "$1")
+        .replace(/\*([^*]+)\*/g, "$1")
+        .trim();
+}
+
+function synthesizeBilingualVoice(characterId: string, rawText: string): Promise<string> {
+    const speechText = cleanDialogueForTts(rawText);
+    const key = `${characterId}\x1f${speechText}`;
+    const cached = _bilingualVoiceAudioCache.get(key);
+    if (cached) return Promise.resolve(cached);
+    const inflight = _bilingualVoiceInFlight.get(key);
+    if (inflight) return inflight;
+    const task = (async () => {
+        const { resolveVoiceConfig, synthesizeSpeech } = await import("@/lib/tts-service");
+        const vc = resolveVoiceConfig(characterId);
+        if (!vc) throw new Error("未绑定语音配置");
+        const blob = await synthesizeSpeech(speechText, vc);
+        if (!blob) throw new Error("合成失败");
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = () => reject(new Error("音频编码失败"));
+            reader.readAsDataURL(blob);
+        });
+        _bilingualVoiceAudioCache.set(key, dataUrl);
+        return dataUrl;
+    })();
+    _bilingualVoiceInFlight.set(key, task);
+    task.catch(() => {}).then(() => { _bilingualVoiceInFlight.delete(key); });
+    return task;
+}
+
 export const BilingualTextBlock = memo(function BilingualTextBlock({
     text,
     onActionSelect,
@@ -590,6 +628,7 @@ export const BilingualTextBlock = memo(function BilingualTextBlock({
     className,
     defaultExpanded = false,
     htmlFrameVariant,
+    characterId,
 }: {
     text: string;
     onActionSelect?: (text: string) => void;
@@ -597,12 +636,61 @@ export const BilingualTextBlock = memo(function BilingualTextBlock({
     className?: string;
     defaultExpanded?: boolean;
     htmlFrameVariant?: ChatHtmlFrameVariant;
+    characterId?: string;
 }) {
     const bilingual = splitBilingualText(text);
     const [expanded, setExpanded] = useState(defaultExpanded);
+    const [ttsState, setTtsState] = useState<"idle" | "loading" | "playing" | "error">("idle");
+    const audioRef = useRef<HTMLAudioElement | null>(null);
+    const mountedRef = useRef(true);
+
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => {
+            mountedRef.current = false;
+            if (audioRef.current) {
+                try { audioRef.current.pause(); audioRef.current.removeAttribute("src"); audioRef.current.load(); } catch { /* ignore */ }
+                audioRef.current = null;
+            }
+        };
+    }, []);
+
     useEffect(() => {
         setExpanded(defaultExpanded);
     }, [text, defaultExpanded]);
+
+    const handlePlayVoice = useCallback((e: React.MouseEvent) => {
+        e.stopPropagation();
+        if (!bilingual || !characterId) return;
+        if (ttsState === "loading") return;
+        if (ttsState === "playing" && audioRef.current) {
+            const active = audioRef.current;
+            audioRef.current = null;
+            try { active.pause(); active.removeAttribute("src"); active.load(); } catch { /* ignore */ }
+            setTtsState("idle");
+            return;
+        }
+        setTtsState("loading");
+        synthesizeBilingualVoice(characterId, bilingual.original)
+            .then((dataUrl) => {
+                if (!mountedRef.current) return;
+                const audio = new Audio(dataUrl);
+                audioRef.current = audio;
+                setTtsState("playing");
+                const finalize = () => {
+                    if (audioRef.current === audio) audioRef.current = null;
+                    try { audio.pause(); audio.removeAttribute("src"); audio.load(); } catch { /* ignore */ }
+                    if (mountedRef.current) setTtsState("idle");
+                };
+                audio.onended = finalize;
+                audio.onerror = finalize;
+                audio.play().catch(finalize);
+            })
+            .catch(() => {
+                if (mountedRef.current) setTtsState("error");
+            });
+    }, [bilingual, characterId, ttsState]);
+
     const renderContent = (content: string, extraClass?: string) => {
         if (mode === "plain") return <PlainTextContent content={content} className={extraClass} />;
         return (
@@ -621,17 +709,31 @@ export const BilingualTextBlock = memo(function BilingualTextBlock({
             <div className="chat-bilingual-section">
                 {renderContent(bilingual.original, "chat-bilingual-content")}
             </div>
-            <button
-                type="button"
-                className="chat-bilingual-toggle"
-                onClick={(e) => {
-                    e.stopPropagation();
-                    setExpanded(v => !v);
-                }}
-                aria-expanded={expanded}
-            >
-                {expanded ? "收起中文" : "中文"}
-            </button>
+            <div style={{ display: "inline-flex", alignItems: "center", gap: "10px", alignSelf: "flex-start" }}>
+                <button
+                    type="button"
+                    className="chat-bilingual-toggle"
+                    onClick={(e) => {
+                        e.stopPropagation();
+                        setExpanded(v => !v);
+                    }}
+                    aria-expanded={expanded}
+                >
+                    {expanded ? "收起中文" : "中文"}
+                </button>
+                {characterId && (
+                    <button
+                        type="button"
+                        className="chat-bilingual-toggle"
+                        onClick={handlePlayVoice}
+                        onPointerDown={(e) => e.stopPropagation()}
+                        title="播放角色语音"
+                        style={{ textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "3px" }}
+                    >
+                        {ttsState === "loading" ? "合成中…" : ttsState === "playing" ? "■ 停止" : ttsState === "error" ? "↻ 重试语音" : "▷ 播放"}
+                    </button>
+                )}
+            </div>
             {expanded && (
                 <>
                     <div className="chat-bilingual-divider" />
